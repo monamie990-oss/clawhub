@@ -382,28 +382,7 @@ function filterPublisherListItems(
   });
 }
 
-async function getPublicPublisherCounts(ctx: Pick<QueryCtx, "db">): Promise<PublisherListCounts> {
-  const [individuals, orgs] = await Promise.all([
-    ctx.db
-      .query("publishers")
-      .withIndex("by_active_kind_handle", (q) =>
-        q.eq("deletedAt", undefined).eq("deactivatedAt", undefined).eq("kind", "user"),
-      )
-      .collect(),
-    ctx.db
-      .query("publishers")
-      .withIndex("by_active_kind_handle", (q) =>
-        q.eq("deletedAt", undefined).eq("deactivatedAt", undefined).eq("kind", "org"),
-      )
-      .collect(),
-  ]);
-  const items = (
-    await Promise.all(
-      [...individuals, ...orgs].map((publisher) => toPublisherListItem(ctx, publisher)),
-    )
-  )
-    .filter((item): item is PublisherListItem => Boolean(item))
-    .filter((item) => item.stats.skills + item.stats.packages > 0);
+function getPublisherListCounts(items: PublisherListItem[]): PublisherListCounts {
   const individualCount = items.filter((publisher) => publisher.kind === "user").length;
   const organizationCount = items.filter((publisher) => publisher.kind === "org").length;
   return {
@@ -1028,14 +1007,25 @@ export const listPublicPage = query({
       kind: kindFilter,
       query: queryText,
     }).sort(comparePublisherListItems);
-    const globalCounts = await getPublicPublisherCounts(ctx);
-    const counts = queryText
-      ? {
-          all: items.length,
-          organizations: items.filter((i) => i.kind === "org").length,
-          individuals: items.filter((i) => i.kind === "user").length,
-        }
-      : globalCounts;
+    const globalPublisherItems = kindFilter
+      ? (
+          await Promise.all(
+            (
+              await ctx.db
+                .query("publishers")
+                .withIndex("by_active_total_downloads", (q) =>
+                  q.eq("deletedAt", undefined).eq("deactivatedAt", undefined),
+                )
+                .order("desc")
+                .take(MAX_PUBLIC_PUBLISHER_LIST_LIMIT)
+            ).map((publisher) => toPublisherListItem(ctx, publisher)),
+          )
+        )
+          .filter((item): item is PublisherListItem => Boolean(item))
+          .filter((item) => item.stats.skills + item.stats.packages > 0)
+      : publisherItems;
+    const globalCounts = getPublisherListCounts(globalPublisherItems);
+    const counts = queryText ? getPublisherListCounts(items) : globalCounts;
     const nextOffset = safeOffset + numItems;
     const page = items.slice(safeOffset, nextOffset);
 
