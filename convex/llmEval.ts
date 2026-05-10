@@ -30,9 +30,11 @@ const internalRefs = internal as unknown as {
     getPackageByIdInternal: unknown;
     updateReleaseLlmAnalysisInternal: unknown;
     getSuspiciousPluginReleaseBatchForLlmRescanInternal: unknown;
+    getPluginScanStatusCountPageInternal: unknown;
   };
   skills: {
     getSuspiciousSkillBatchForLlmRescanInternal: unknown;
+    getSuspiciousSkillCountPageInternal: unknown;
   };
   llmEval: {
     evaluateWithLlm: unknown;
@@ -818,6 +820,21 @@ type SuspiciousSkillLlmRescanBatch = {
   isDone: boolean;
 };
 
+type SuspiciousSkillCountPage = {
+  examined: number;
+  suspicious: number;
+  malicious: number;
+  blocked: number;
+  noLatestVersion: number;
+  rescanable: number;
+  llmOnly: number;
+  vtOnly: number;
+  both: number;
+  noScannerReason: number;
+  continueCursor: string | null;
+  isDone: boolean;
+};
+
 export const scheduleSuspiciousSkillLlmRescanInternal: ReturnType<typeof internalAction> =
   internalAction({
     args: {
@@ -957,6 +974,22 @@ type SuspiciousPluginLlmRescanBatch = {
   isDone: boolean;
 };
 
+type PluginScanStatusCountPage = {
+  examined: number;
+  activePlugins: number;
+  clean: number;
+  pending: number;
+  notRun: number;
+  suspicious: number;
+  malicious: number;
+  unknown: number;
+  latestSuspicious: number;
+  latestMalicious: number;
+  latestBlocked: number;
+  continueCursor: string | null;
+  isDone: boolean;
+};
+
 export const scheduleSuspiciousPluginLlmRescanInternal: ReturnType<typeof internalAction> =
   internalAction({
     args: {
@@ -1072,6 +1105,120 @@ export const scheduleSuspiciousPluginLlmRescanInternal: ReturnType<typeof intern
       };
     },
   });
+
+export const countSuspiciousInventoryInternal: ReturnType<typeof internalAction> = internalAction({
+  args: {
+    batchSize: v.optional(v.number()),
+    maxPages: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const batchSize = Math.max(1, Math.min(Math.floor(args.batchSize ?? 200), 200));
+    const maxPages = Math.max(1, Math.min(Math.floor(args.maxPages ?? 500), 1_000));
+    const startedAt = Date.now();
+
+    let skillCursor: string | null = null;
+    let skillPages = 0;
+    let skillComplete = false;
+    const skills = {
+      examined: 0,
+      suspicious: 0,
+      malicious: 0,
+      blocked: 0,
+      noLatestVersion: 0,
+      rescanable: 0,
+      llmOnly: 0,
+      vtOnly: 0,
+      both: 0,
+      noScannerReason: 0,
+    };
+
+    while (skillPages < maxPages) {
+      const page: SuspiciousSkillCountPage = await runQueryRef(
+        ctx,
+        internalRefs.skills.getSuspiciousSkillCountPageInternal,
+        { cursor: skillCursor, batchSize },
+      );
+      skills.examined += page.examined;
+      skills.suspicious += page.suspicious;
+      skills.malicious += page.malicious;
+      skills.blocked += page.blocked;
+      skills.noLatestVersion += page.noLatestVersion;
+      skills.rescanable += page.rescanable;
+      skills.llmOnly += page.llmOnly;
+      skills.vtOnly += page.vtOnly;
+      skills.both += page.both;
+      skills.noScannerReason += page.noScannerReason;
+      skillPages++;
+      skillCursor = page.continueCursor;
+      if (page.isDone || !skillCursor) {
+        skillComplete = true;
+        break;
+      }
+    }
+
+    let pluginCursor: string | null = null;
+    let pluginPages = 0;
+    let pluginComplete = false;
+    const plugins = {
+      examined: 0,
+      activePlugins: 0,
+      clean: 0,
+      pending: 0,
+      notRun: 0,
+      suspicious: 0,
+      malicious: 0,
+      unknown: 0,
+      latestSuspicious: 0,
+      latestMalicious: 0,
+      latestBlocked: 0,
+    };
+
+    while (pluginPages < maxPages) {
+      const page: PluginScanStatusCountPage = await runQueryRef(
+        ctx,
+        internalRefs.packages.getPluginScanStatusCountPageInternal,
+        { cursor: pluginCursor, batchSize },
+      );
+      plugins.examined += page.examined;
+      plugins.activePlugins += page.activePlugins;
+      plugins.clean += page.clean;
+      plugins.pending += page.pending;
+      plugins.notRun += page.notRun;
+      plugins.suspicious += page.suspicious;
+      plugins.malicious += page.malicious;
+      plugins.unknown += page.unknown;
+      plugins.latestSuspicious += page.latestSuspicious;
+      plugins.latestMalicious += page.latestMalicious;
+      plugins.latestBlocked += page.latestBlocked;
+      pluginPages++;
+      pluginCursor = page.continueCursor;
+      if (page.isDone || !pluginCursor) {
+        pluginComplete = true;
+        break;
+      }
+    }
+
+    return {
+      generatedAt: new Date().toISOString(),
+      complete: skillComplete && pluginComplete,
+      durationMs: Date.now() - startedAt,
+      batchSize,
+      maxPages,
+      skills: {
+        ...skills,
+        pages: skillPages,
+        complete: skillComplete,
+        cursor: skillCursor,
+      },
+      plugins: {
+        ...plugins,
+        pages: pluginPages,
+        complete: pluginComplete,
+        cursor: pluginCursor,
+      },
+    };
+  },
+});
 
 export const evaluateCommentForScam = internalAction({
   args: {

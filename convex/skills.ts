@@ -5114,6 +5114,78 @@ export const getSuspiciousSkillBatchForLlmRescanInternal = internalQuery({
   },
 });
 
+export const getSuspiciousSkillCountPageInternal = internalQuery({
+  args: {
+    cursor: v.optional(v.union(v.string(), v.null())),
+    batchSize: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const batchSize = clampInt(args.batchSize ?? 200, 1, 200);
+    const { page, continueCursor, isDone } = await ctx.db
+      .query("skills")
+      .withIndex("by_nonsuspicious_updated", (q) =>
+        q.eq("softDeletedAt", undefined).eq("isSuspicious", true),
+      )
+      .order("asc")
+      .paginate({ cursor: args.cursor ?? null, numItems: batchSize });
+
+    let malicious = 0;
+    let blocked = 0;
+    let noLatestVersion = 0;
+    let rescanable = 0;
+    let llmOnly = 0;
+    let vtOnly = 0;
+    let both = 0;
+    let noScannerReason = 0;
+
+    for (const skill of page) {
+      const hasMaliciousCode =
+        skill.moderationVerdict === "malicious" ||
+        (skill.moderationReasonCodes ?? []).some((code) => code.startsWith("malicious."));
+      if (hasMaliciousCode) {
+        malicious++;
+        continue;
+      }
+      if ((skill.moderationFlags ?? []).includes("blocked.malware")) {
+        blocked++;
+        continue;
+      }
+      if (!skill.latestVersionId) {
+        noLatestVersion++;
+        continue;
+      }
+
+      rescanable++;
+      const hasLlmSuspicious = skillHasScannerSuspiciousReason(skill, "llm");
+      const hasVtSuspicious = skillHasScannerSuspiciousReason(skill, "vt");
+      if (hasLlmSuspicious && hasVtSuspicious) {
+        both++;
+      } else if (hasLlmSuspicious) {
+        llmOnly++;
+      } else if (hasVtSuspicious) {
+        vtOnly++;
+      } else {
+        noScannerReason++;
+      }
+    }
+
+    return {
+      examined: page.length,
+      suspicious: page.length,
+      malicious,
+      blocked,
+      noLatestVersion,
+      rescanable,
+      llmOnly,
+      vtOnly,
+      both,
+      noScannerReason,
+      continueCursor,
+      isDone,
+    };
+  },
+});
+
 /**
  * Get active latest skill versions whose static scan is missing or uses an older engine version.
  * Used to backfill new static rules onto already-published skills.
