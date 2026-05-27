@@ -11,6 +11,7 @@ import {
   isReservedPublicOwnerHandle,
 } from "./lib/publicRouteReservations";
 import {
+  canAccessPublisherOwnerScope,
   ensurePersonalPublisherForUser,
   getActiveUserByHandleOrPersonalPublisher,
   getPublisherByHandle,
@@ -26,6 +27,11 @@ import { readCanonicalStat } from "./lib/skillStats";
 const PUBLISHER_HANDLE_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 const MAX_PUBLIC_PUBLISHER_LIST_LIMIT = 500;
 const PUBLISHER_LIST_PREVIEW_LIMIT = 3;
+const publisherRoleValidator = v.union(
+  v.literal("owner"),
+  v.literal("admin"),
+  v.literal("publisher"),
+);
 
 type PublisherListStats = {
   skills: number;
@@ -92,6 +98,12 @@ function validateHandle(rawHandle: string) {
     throw new ConvexError(formatReservedPublicOwnerHandleMessage(handle));
   }
   return handle;
+}
+
+function assertOrgPublisherMembershipManagement(publisher: Doc<"publishers">) {
+  if (publisher.kind !== "org") {
+    throw new ConvexError("Personal publishers do not support member management");
+  }
 }
 
 async function getUserByHandle(ctx: Pick<MutationCtx, "db">, handle: string) {
@@ -888,6 +900,24 @@ export const getMemberRoleInternal = internalQuery({
     (await getPublisherMembership(ctx, args.publisherId, args.userId))?.role ?? null,
 });
 
+export const canAccessOwnerScopeInternal = internalQuery({
+  args: {
+    publisherId: v.id("publishers"),
+    userId: v.id("users"),
+    allowedPublisherRoles: v.optional(v.array(publisherRoleValidator)),
+    legacyOwnerUserId: v.optional(v.id("users")),
+  },
+  handler: async (ctx, args) => {
+    const publisher = await ctx.db.get(args.publisherId);
+    return await canAccessPublisherOwnerScope(ctx, {
+      publisher,
+      userId: args.userId,
+      allowedPublisherRoles: args.allowedPublisherRoles,
+      legacyOwnerUserId: args.legacyOwnerUserId,
+    });
+  },
+});
+
 export const ensurePersonalPublisherInternal = internalMutation({
   args: { userId: v.id("users") },
   handler: async (ctx, args) => {
@@ -942,6 +972,19 @@ export const resolvePublishTargetForUserInternal = internalMutation({
         `Publisher "@${requestedHandle}" not found. Create the "@${requestedHandle}" organization on ClawHub or choose a different owner.`,
       );
     }
+    if (publisher.kind === "user") {
+      if (publisher.linkedUserId !== actor._id) {
+        throw new ConvexError(
+          `You do not have publish access for "@${requestedHandle}". Ask an owner or admin of "@${requestedHandle}" to add you.`,
+        );
+      }
+      return {
+        publisherId: publisher._id,
+        handle: publisher.handle,
+        kind: publisher.kind,
+        linkedUserId: publisher.linkedUserId,
+      };
+    }
     const membership = await getPublisherMembership(ctx, publisher._id, actor._id);
     if (!membership || !isPublisherRoleAllowed(membership.role, [minimumRole])) {
       throw new ConvexError(
@@ -971,11 +1014,17 @@ export const listMine = query({
     const publishers = await Promise.all(
       memberships.map(async (membership) => {
         const publisher = await ctx.db.get(membership.publisherId);
+        if (publisher?.kind === "user") {
+          const isLinkedPersonal = publisher.linkedUserId === userId;
+          const isLegacyPersonal =
+            !publisher.linkedUserId && user.personalPublisherId === publisher._id;
+          if (!isLinkedPersonal && !isLegacyPersonal) return null;
+        }
         const publicPublisher = await toPublicPublisherWithOfficial(ctx, publisher);
         if (!publicPublisher) return null;
         return {
           publisher: publicPublisher,
-          role: membership.role,
+          role: publisher?.kind === "user" ? "owner" : membership.role,
         };
       }),
     );
@@ -1499,6 +1548,7 @@ export const addMember = mutation({
     if (!membership || !isPublisherRoleAllowed(membership.role, ["admin"])) {
       throw new ConvexError("Forbidden");
     }
+    assertOrgPublisherMembershipManagement(publisher);
     if (args.role === "owner" && membership.role !== "owner") {
       throw new ConvexError("Only org owners can promote members to owner");
     }
@@ -1547,15 +1597,39 @@ export const removeMember = mutation({
     userId: v.id("users"),
   },
   handler: async (ctx, args) => {
-    const { userId } = await requireUser(ctx);
+    const { user, userId } = await requireUser(ctx);
     const publisher = await ctx.db.get(args.publisherId);
     if (!publisher || publisher.deletedAt || publisher.deactivatedAt) {
       throw new ConvexError("Publisher not found");
+    }
+    if (publisher.kind === "user") {
+      const actorMembership = await getPublisherMembership(ctx, publisher._id, userId);
+      const isPersonalOwner =
+        publisher.linkedUserId === userId ||
+        (!publisher.linkedUserId &&
+          (user.personalPublisherId === publisher._id || actorMembership?.role === "owner"));
+      if (!isPersonalOwner) throw new ConvexError("Forbidden");
+      const targetMembership = await getPublisherMembership(ctx, publisher._id, args.userId);
+      if (!targetMembership) return { ok: true };
+      if (args.userId === (publisher.linkedUserId ?? userId)) {
+        throw new ConvexError("Personal publisher owner membership cannot be removed");
+      }
+      await ctx.db.delete(targetMembership._id);
+      await ctx.db.insert("auditLogs", {
+        actorUserId: userId,
+        action: "publisher.member.remove",
+        targetType: "publisher",
+        targetId: publisher._id,
+        metadata: { memberUserId: args.userId },
+        createdAt: Date.now(),
+      });
+      return { ok: true };
     }
     const actorMembership = await getPublisherMembership(ctx, publisher._id, userId);
     if (!actorMembership || !isPublisherRoleAllowed(actorMembership.role, ["admin"])) {
       throw new ConvexError("Forbidden");
     }
+    assertOrgPublisherMembershipManagement(publisher);
     const targetMembership = await getPublisherMembership(ctx, publisher._id, args.userId);
     if (!targetMembership) return { ok: true };
     if (targetMembership.role === "owner" && actorMembership.role !== "owner") {

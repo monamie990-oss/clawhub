@@ -68,10 +68,12 @@ import {
 import { toPublicPublisher } from "./lib/public";
 import {
   assertCanManageOwnedResource,
+  canAccessPublisherOwnerScope,
   getPublisherByHandle,
   getPersonalPublisherForUser,
   getOwnerPublisher,
   getPublisherMembership,
+  isPublisherActive,
   isPublisherRoleAllowed,
   normalizePublisherHandle,
 } from "./lib/publishers";
@@ -587,6 +589,8 @@ type PackageDigestLike = Pick<
   capabilityTag?: string;
   pluginCategory?: string;
 };
+type PackageOwnerAccessRef = Pick<PackageDigestLike, "ownerUserId" | "ownerPublisherId"> &
+  Partial<Pick<PackageDigestLike, "ownerKind">>;
 type PublicPageCursorState = {
   cursor: string | null;
   offset: number;
@@ -690,46 +694,51 @@ function requiresPrivilegedPackageAccess(
 
 async function viewerCanAccessPackageOwner(
   ctx: DbReaderCtx,
-  digest: Pick<PackageDigestLike, "ownerUserId" | "ownerPublisherId">,
+  digest: PackageOwnerAccessRef,
   viewerUserId: Id<"users"> | undefined,
   membershipCache?: Map<string, Promise<boolean>>,
 ) {
   if (!viewerUserId) return false;
   if (!digest.ownerPublisherId) return digest.ownerUserId === viewerUserId;
 
-  const cacheKey = String(digest.ownerPublisherId);
+  const ownerPublisherId = digest.ownerPublisherId;
+  const cacheKey = `${ownerPublisherId}:${digest.ownerUserId}`;
   const cached = membershipCache?.get(cacheKey);
   if (cached) return await cached;
 
-  const membershipPromise = getPublisherMembership(ctx, digest.ownerPublisherId, viewerUserId).then(
-    Boolean,
-  );
+  const membershipPromise = (async () => {
+    const ownerPublisher = await ctx.db.get(ownerPublisherId);
+    return await canAccessPublisherOwnerScope(ctx, {
+      publisher: ownerPublisher,
+      userId: viewerUserId,
+      legacyOwnerUserId: digest.ownerUserId,
+    });
+  })();
   membershipCache?.set(cacheKey, membershipPromise);
-  if (await membershipPromise) return true;
-
-  if (digest.ownerUserId !== viewerUserId) return false;
-  const ownerPublisher = await ctx.db.get(digest.ownerPublisherId);
-  return ownerPublisher?.kind === "user" && ownerPublisher.linkedUserId === viewerUserId;
+  return await membershipPromise;
 }
 
 async function viewerCanManagePackageOwner(
   ctx: DbReaderCtx,
-  digest: Pick<PackageDigestLike, "ownerUserId" | "ownerPublisherId">,
+  digest: PackageOwnerAccessRef,
   viewerUserId: Id<"users"> | undefined,
 ) {
   if (!viewerUserId) return false;
   if (!digest.ownerPublisherId) return digest.ownerUserId === viewerUserId;
 
   const ownerPublisher = await ctx.db.get(digest.ownerPublisherId);
-  if (ownerPublisher?.kind === "user" && ownerPublisher.linkedUserId === viewerUserId) return true;
-
-  const membership = await getPublisherMembership(ctx, digest.ownerPublisherId, viewerUserId);
-  return Boolean(membership && isPublisherRoleAllowed(membership.role, ["admin"]));
+  return await canAccessPublisherOwnerScope(ctx, {
+    publisher: ownerPublisher,
+    userId: viewerUserId,
+    allowedPublisherRoles: ["admin"],
+    legacyOwnerUserId: digest.ownerUserId,
+  });
 }
 
 async function canViewerReadPackage(
   ctx: DbReaderCtx,
-  digest: Pick<PackageDigestLike, "channel" | "scanStatus" | "ownerUserId" | "ownerPublisherId">,
+  digest: Pick<PackageDigestLike, "channel" | "scanStatus" | "ownerUserId" | "ownerPublisherId"> &
+    Partial<Pick<PackageDigestLike, "ownerKind">>,
   viewerUserId: Id<"users"> | undefined,
   membershipCache?: Map<string, Promise<boolean>>,
 ) {
@@ -1023,16 +1032,19 @@ async function listDashboardPackagesForOwnerPublisher(
 ) {
   const takeLimit = Math.min(limit * 5, 500);
   const ownerPublisher = await ctx.db.get(ownerPublisherId);
-  const membership =
-    (await ctx.db
-      .query("publisherMembers")
-      .withIndex("by_publisher_user", (q) =>
-        q.eq("publisherId", ownerPublisherId).eq("userId", viewerUserId),
-      )
-      .unique()) ?? null;
-  const isOwnDashboard = Boolean(
-    membership || (ownerPublisher?.kind === "user" && ownerPublisher.linkedUserId === viewerUserId),
-  );
+  const owner =
+    ownerPublisher?.kind === "user" && !ownerPublisher.linkedUserId
+      ? await ctx.db.get(viewerUserId)
+      : null;
+  const isOwnDashboard =
+    (await canAccessPublisherOwnerScope(ctx, {
+      publisher: ownerPublisher,
+      userId: viewerUserId,
+    })) ||
+    (ownerPublisher?.kind === "user" &&
+      isPublisherActive(ownerPublisher) &&
+      !ownerPublisher.linkedUserId &&
+      owner?.personalPublisherId === ownerPublisherId);
   if (!isOwnDashboard) return [];
 
   const scopedEntries = await ctx.db
@@ -1040,14 +1052,17 @@ async function listDashboardPackagesForOwnerPublisher(
     .withIndex("by_owner_publisher", (q) => q.eq("ownerPublisherId", ownerPublisherId))
     .order("desc")
     .take(takeLimit);
-  const legacyEntries =
-    ownerPublisher?.kind === "user" && ownerPublisher.linkedUserId
-      ? await ctx.db
-          .query("packages")
-          .withIndex("by_owner", (q) => q.eq("ownerUserId", ownerPublisher.linkedUserId!))
-          .order("desc")
-          .take(takeLimit)
-      : [];
+  const legacyPersonalOwnerUserId =
+    ownerPublisher?.kind === "user"
+      ? (ownerPublisher.linkedUserId ?? (isOwnDashboard ? viewerUserId : undefined))
+      : undefined;
+  const legacyEntries = legacyPersonalOwnerUserId
+    ? await ctx.db
+        .query("packages")
+        .withIndex("by_owner", (q) => q.eq("ownerUserId", legacyPersonalOwnerUserId))
+        .order("desc")
+        .take(takeLimit)
+    : [];
 
   const combined = [...scopedEntries, ...legacyEntries].filter(
     (pkg, index, all) =>
@@ -1059,6 +1074,33 @@ async function listDashboardPackagesForOwnerPublisher(
   return (
     await Promise.all(limited.map(async (pkg) => await toDashboardPackageListItem(ctx, pkg)))
   ).filter((pkg): pkg is DashboardPackageListItem => Boolean(pkg));
+}
+
+async function packageBelongsToOwnerUserDashboardScope(
+  ctx: Pick<QueryCtx, "db">,
+  pkg: Pick<Doc<"packages">, "ownerUserId" | "ownerPublisherId">,
+  ownerUserId: Id<"users">,
+) {
+  if (pkg.ownerUserId !== ownerUserId) return false;
+  if (!pkg.ownerPublisherId) return true;
+  const ownerPublisher = await ctx.db.get(pkg.ownerPublisherId);
+  if (!ownerPublisher || !isPublisherActive(ownerPublisher) || ownerPublisher.kind !== "user") {
+    return false;
+  }
+  return ownerPublisher.linkedUserId ? ownerPublisher.linkedUserId === ownerUserId : true;
+}
+
+async function filterPackagesForOwnerUserDashboard(
+  ctx: Pick<QueryCtx, "db">,
+  packages: Doc<"packages">[],
+  ownerUserId: Id<"users">,
+) {
+  const scoped = await Promise.all(
+    packages.map(async (pkg) =>
+      (await packageBelongsToOwnerUserDashboardScope(ctx, pkg, ownerUserId)) ? pkg : null,
+    ),
+  );
+  return scoped.filter((pkg): pkg is Doc<"packages"> => Boolean(pkg));
 }
 
 async function listDashboardPackagesForOwnerUser(
@@ -1074,7 +1116,8 @@ async function listDashboardPackagesForOwnerUser(
     .withIndex("by_owner", (q) => q.eq("ownerUserId", ownerUserId))
     .order("desc")
     .take(takeLimit);
-  const filtered = entries.filter((pkg) => !pkg.softDeletedAt).slice(0, limit);
+  const scoped = await filterPackagesForOwnerUserDashboard(ctx, entries, ownerUserId);
+  const filtered = scoped.filter((pkg) => !pkg.softDeletedAt).slice(0, limit);
   return (
     await Promise.all(filtered.map(async (pkg) => await toDashboardPackageListItem(ctx, pkg)))
   ).filter((pkg): pkg is DashboardPackageListItem => Boolean(pkg));
@@ -5656,10 +5699,16 @@ async function transferPackageOwnerForUser(
   if (pkg.ownerPublisherId) {
     const sourcePublisher = await ctx.db.get(pkg.ownerPublisherId);
     const sourceMembership = await getPublisherMembership(ctx, pkg.ownerPublisherId, actor._id);
+    const canManagePersonalSource =
+      sourcePublisher?.kind === "user" &&
+      (sourcePublisher.linkedUserId
+        ? sourcePublisher.linkedUserId === actor._id
+        : pkg.ownerUserId === actor._id);
     const canManageSource =
       actor.role === "admin" ||
-      sourcePublisher?.linkedUserId === actor._id ||
-      Boolean(sourceMembership && isPublisherRoleAllowed(sourceMembership.role, ["admin"]));
+      (sourcePublisher?.kind === "user"
+        ? canManagePersonalSource
+        : Boolean(sourceMembership && isPublisherRoleAllowed(sourceMembership.role, ["admin"])));
     if (!canManageSource) {
       throw new ConvexError("Forbidden");
     }
@@ -5689,10 +5738,18 @@ async function transferPackageOwnerForUser(
     destinationPublisher._id,
     actor._id,
   );
+  const canManagePersonalDestination =
+    destinationPublisher.kind === "user" &&
+    (destinationPublisher.linkedUserId
+      ? destinationPublisher.linkedUserId === actor._id
+      : actor.personalPublisherId === destinationPublisher._id);
   const canManageDestination =
     actor.role === "admin" ||
-    destinationPublisher.linkedUserId === actor._id ||
-    Boolean(destinationMembership && isPublisherRoleAllowed(destinationMembership.role, ["admin"]));
+    (destinationPublisher.kind === "user"
+      ? canManagePersonalDestination
+      : Boolean(
+          destinationMembership && isPublisherRoleAllowed(destinationMembership.role, ["admin"]),
+        ));
   if (!canManageDestination) {
     throw new ConvexError(
       `You do not have admin access for "@${destinationHandle}". Ask an owner or admin to add you before transferring this package.`,

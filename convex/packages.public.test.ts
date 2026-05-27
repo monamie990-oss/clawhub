@@ -14,6 +14,7 @@ import {
   publishPackageForUserInternal,
   listPackageReportsInternal,
   getPackageModerationStatusForUserInternal,
+  getClawScanNoteSettings,
   reportPackageForUserInternal,
   triagePackageReportForUserInternal,
   submitPackageAppealForUserInternal,
@@ -341,6 +342,12 @@ const getPackageModerationStatusForUserInternalHandler = (
       package: { name: string; reportCount: number };
       latestRelease: { version: string; scanStatus: string; blockedFromDownload: boolean } | null;
     }
+  >
+)._handler;
+const getClawScanNoteSettingsHandler = (
+  getClawScanNoteSettings as unknown as WrappedHandler<
+    { name: string; candidateNames?: string[] },
+    { package: { name: string }; latestRelease: { version: string } } | null
   >
 )._handler;
 const submitPackageAppealForUserInternalHandler = (
@@ -733,6 +740,7 @@ function makeDigestCtx(options: {
   }>;
   exactPackages?: Array<Record<string, unknown>>;
   exactDigests?: Array<Record<string, unknown>>;
+  publisherDocs?: Record<string, Record<string, unknown>>;
   publisherMemberships?: Record<string, "owner" | "admin" | "publisher">;
 }) {
   const pageByTable = new Map<
@@ -839,6 +847,11 @@ function makeDigestCtx(options: {
     take,
     ctx: {
       db: {
+        get: vi.fn(async (id: string) => {
+          if (options.publisherDocs?.[id]) return options.publisherDocs[id];
+          if (options.publisherMemberships?.[id]) return { _id: id, kind: "org" };
+          return null;
+        }),
         query: vi.fn((table: string) => {
           if (table === "packages") {
             return {
@@ -1277,6 +1290,7 @@ function makeTransferPackageOwnerCtx(options?: {
 function makeUserTransferPackageOwnerCtx(options?: {
   pkg?: Record<string, unknown> | null;
   actor?: Record<string, unknown> | null;
+  sourcePublisher?: Record<string, unknown> | null;
   destinationPublisher?: Record<string, unknown> | null;
   sourceMembershipRole?: "owner" | "admin" | "publisher" | null;
   destinationMembershipRole?: "owner" | "admin" | "publisher" | null;
@@ -1315,6 +1329,7 @@ function makeUserTransferPackageOwnerCtx(options?: {
         get: vi.fn(async (id: string) => {
           if (id === "users:vincent") return actor;
           if (id === "publishers:vincent") {
+            if (options?.sourcePublisher !== undefined) return options.sourcePublisher;
             return {
               _id: id,
               kind: "user",
@@ -1715,6 +1730,148 @@ describe("packages public queries", () => {
     });
 
     expect(result.page.map((entry) => entry.name)).toEqual(["secret-plugin", "public-plugin"]);
+  });
+
+  it("does not let stale personal ownerUserId expose private package digests", async () => {
+    const { ctx } = makeDigestCtx({
+      pages: [
+        {
+          page: [
+            makeDigest("stale-personal-secret", {
+              channel: "private",
+              ownerKind: "user",
+              ownerUserId: "users:viewer",
+              ownerPublisherId: "publishers:other-personal",
+            }),
+            makeDigest("public-plugin"),
+          ],
+          isDone: true,
+          continueCursor: "",
+        },
+      ],
+    });
+
+    const result = await listPageForViewerInternalHandler(ctx, {
+      paginationOpts: { cursor: null, numItems: 10 },
+      viewerUserId: "users:viewer",
+    });
+
+    expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
+  });
+
+  it("lets legacy no-link personal package owners list private package digests", async () => {
+    const { ctx } = makeDigestCtx({
+      publisherDocs: {
+        "publishers:legacy-personal": {
+          _id: "publishers:legacy-personal",
+          kind: "user",
+          handle: "viewer",
+          linkedUserId: undefined,
+        },
+      },
+      pages: [
+        {
+          page: [
+            makeDigest("legacy-personal-secret", {
+              channel: "private",
+              ownerKind: "user",
+              ownerUserId: "users:viewer",
+              ownerPublisherId: "publishers:legacy-personal",
+            }),
+            makeDigest("public-plugin"),
+          ],
+          isDone: true,
+          continueCursor: "",
+        },
+      ],
+    });
+
+    const result = await listPageForViewerInternalHandler(ctx, {
+      paginationOpts: { cursor: null, numItems: 10 },
+      viewerUserId: "users:viewer",
+    });
+
+    expect(result.page.map((entry) => entry.name)).toEqual([
+      "legacy-personal-secret",
+      "public-plugin",
+    ]);
+  });
+
+  it("does not let inactive no-link personal publishers expose private package digests", async () => {
+    const { ctx } = makeDigestCtx({
+      publisherDocs: {
+        "publishers:legacy-personal": {
+          _id: "publishers:legacy-personal",
+          kind: "user",
+          handle: "viewer",
+          linkedUserId: undefined,
+          deactivatedAt: 123,
+        },
+      },
+      pages: [
+        {
+          page: [
+            makeDigest("legacy-personal-secret", {
+              channel: "private",
+              ownerKind: "user",
+              ownerUserId: "users:viewer",
+              ownerPublisherId: "publishers:legacy-personal",
+            }),
+            makeDigest("public-plugin"),
+          ],
+          isDone: true,
+          continueCursor: "",
+        },
+      ],
+    });
+
+    const result = await listPageForViewerInternalHandler(ctx, {
+      paginationOpts: { cursor: null, numItems: 10 },
+      viewerUserId: "users:viewer",
+    });
+
+    expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
+  });
+
+  it("does not reuse legacy no-link personal access across package owners", async () => {
+    const { ctx } = makeDigestCtx({
+      publisherDocs: {
+        "publishers:legacy-personal": {
+          _id: "publishers:legacy-personal",
+          kind: "user",
+          handle: "viewer",
+          linkedUserId: undefined,
+        },
+      },
+      pages: [
+        {
+          page: [
+            makeDigest("own-legacy-secret", {
+              channel: "private",
+              ownerKind: "user",
+              ownerUserId: "users:viewer",
+              ownerPublisherId: "publishers:legacy-personal",
+            }),
+            makeDigest("stale-legacy-secret", {
+              channel: "private",
+              ownerKind: "user",
+              ownerUserId: "users:other",
+              ownerPublisherId: "publishers:legacy-personal",
+            }),
+            makeDigest("public-plugin"),
+          ],
+          isDone: true,
+          continueCursor: "",
+        },
+      ],
+    });
+
+    const result = await listPageForViewerInternalHandler(ctx, {
+      paginationOpts: { cursor: null, numItems: 10 },
+      viewerUserId: "users:viewer",
+    });
+
+    expect(result.page.map((entry) => entry.name)).toEqual(["own-legacy-secret", "public-plugin"]);
   });
 
   it("allows owners to filter to only their private packages", async () => {
@@ -3376,6 +3533,105 @@ describe("packages public queries", () => {
         toOwner: "opik",
       }),
     ).rejects.toThrow("Forbidden");
+  });
+
+  it("rejects user package transfers through stale personal-publisher memberships", async () => {
+    const { ctx } = makeUserTransferPackageOwnerCtx({
+      pkg: makePackageDoc({
+        name: "@owner/demo",
+        normalizedName: "@owner/demo",
+        ownerUserId: "users:owner",
+        ownerPublisherId: "publishers:vincent",
+      }),
+      sourcePublisher: {
+        _id: "publishers:vincent",
+        kind: "user",
+        handle: "owner",
+        linkedUserId: "users:owner",
+      },
+      sourceMembershipRole: "admin",
+      destinationMembershipRole: "owner",
+    });
+
+    await expect(
+      transferPackageOwnerForUserInternalHandler(ctx, {
+        actorUserId: "users:vincent",
+        name: "demo-plugin",
+        toOwner: "opik",
+      }),
+    ).rejects.toThrow("Forbidden");
+  });
+
+  it("lets owners transfer packages from legacy personal publishers without linked users", async () => {
+    const { ctx } = makeUserTransferPackageOwnerCtx({
+      sourcePublisher: {
+        _id: "publishers:vincent",
+        kind: "user",
+        handle: "vincentkoc",
+        linkedUserId: undefined,
+      },
+      sourceMembershipRole: null,
+      destinationMembershipRole: "owner",
+    });
+
+    await expect(
+      transferPackageOwnerForUserInternalHandler(ctx, {
+        actorUserId: "users:vincent",
+        name: "@opik/opik-openclaw",
+        toOwner: "opik",
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      ownerUserId: "users:vincent",
+      ownerPublisherId: "publishers:opik",
+    });
+  });
+
+  it("rejects package transfers through stale no-link personal memberships", async () => {
+    const { ctx } = makeUserTransferPackageOwnerCtx({
+      pkg: makePackageDoc({
+        name: "@owner/demo",
+        normalizedName: "@owner/demo",
+        ownerUserId: "users:owner",
+        ownerPublisherId: "publishers:vincent",
+      }),
+      sourcePublisher: {
+        _id: "publishers:vincent",
+        kind: "user",
+        handle: "owner",
+        linkedUserId: undefined,
+      },
+      sourceMembershipRole: "admin",
+      destinationMembershipRole: "owner",
+    });
+
+    await expect(
+      transferPackageOwnerForUserInternalHandler(ctx, {
+        actorUserId: "users:vincent",
+        name: "demo-plugin",
+        toOwner: "opik",
+      }),
+    ).rejects.toThrow("Forbidden");
+  });
+
+  it("rejects package transfer destinations through stale no-link personal memberships", async () => {
+    const { ctx } = makeUserTransferPackageOwnerCtx({
+      destinationPublisher: {
+        _id: "publishers:opik",
+        kind: "user",
+        handle: "opik",
+        linkedUserId: undefined,
+      },
+      destinationMembershipRole: "admin",
+    });
+
+    await expect(
+      transferPackageOwnerForUserInternalHandler(ctx, {
+        actorUserId: "users:vincent",
+        name: "@opik/opik-openclaw",
+        toOwner: "opik",
+      }),
+    ).rejects.toThrow('admin access for "@opik"');
   });
 
   it("rejects user package transfers without destination admin access", async () => {
@@ -5599,12 +5855,176 @@ describe("packages public queries", () => {
     ]);
   });
 
+  it("lists packages for the viewer's legacy no-link personal publisher dashboard", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:owner" as never);
+    const result = await listHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === "packageReleases:demo-1") return makeReleaseDoc({ version: "1.0.0" });
+            if (id === "packageReleases:legacy-1") {
+              return makeReleaseDoc({
+                _id: "packageReleases:legacy-1",
+                packageId: "packages:legacy-direct",
+                version: "1.0.0",
+              });
+            }
+            if (id === "users:owner") {
+              return {
+                _id: "users:owner",
+                handle: "owner",
+                personalPublisherId: "publishers:owner",
+              };
+            }
+            if (id === "publishers:owner") {
+              return {
+                _id: "publishers:owner",
+                kind: "user",
+                linkedUserId: undefined,
+              };
+            }
+            return null;
+          }),
+          query: vi.fn((table: string) => {
+            if (table === "packages") {
+              return {
+                withIndex: vi.fn((indexName: string) => {
+                  if (indexName === "by_owner_publisher") {
+                    return {
+                      order: vi.fn(() => ({
+                        take: vi
+                          .fn()
+                          .mockResolvedValue([
+                            makePackageDoc({ ownerPublisherId: "publishers:owner" }),
+                          ]),
+                      })),
+                    };
+                  }
+                  if (indexName === "by_owner") {
+                    return {
+                      order: vi.fn(() => ({
+                        take: vi.fn().mockResolvedValue([
+                          makePackageDoc({
+                            _id: "packages:legacy-direct",
+                            name: "legacy-direct-plugin",
+                            normalizedName: "legacy-direct-plugin",
+                            displayName: "Legacy Direct Plugin",
+                            ownerPublisherId: undefined,
+                            latestReleaseId: "packageReleases:legacy-1",
+                          }),
+                        ]),
+                      })),
+                    };
+                  }
+                  throw new Error(`Unexpected index ${indexName}`);
+                }),
+              };
+            }
+            if (table === "publisherMembers") {
+              return {
+                withIndex: vi.fn(() => ({
+                  unique: vi.fn().mockResolvedValue(null),
+                })),
+              };
+            }
+            throw new Error(`Unexpected table ${table}`);
+          }),
+        },
+      } as never,
+      { ownerPublisherId: "publishers:owner", limit: 20 },
+    );
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        name: "demo-plugin",
+        ownerPublisherId: "publishers:owner",
+      }),
+      expect.objectContaining({
+        name: "legacy-direct-plugin",
+        ownerPublisherId: undefined,
+      }),
+    ]);
+  });
+
+  it("keeps stale publisher-owned package rows out of owner-user dashboards", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:owner" as never);
+    const result = await listHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === "users:owner") {
+              return { _id: "users:owner", handle: "owner" };
+            }
+            if (id === "publishers:other-personal") {
+              return {
+                _id: "publishers:other-personal",
+                kind: "user",
+                linkedUserId: "users:other",
+              };
+            }
+            if (id === "publishers:org") {
+              return { _id: "publishers:org", kind: "org" };
+            }
+            if (id === "packageReleases:legacy-1") {
+              return makeReleaseDoc({
+                _id: "packageReleases:legacy-1",
+                packageId: "packages:legacy-direct",
+                version: "1.0.0",
+              });
+            }
+            return null;
+          }),
+          query: vi.fn((table: string) => {
+            if (table === "packages") {
+              return {
+                withIndex: vi.fn((indexName: string) => {
+                  if (indexName !== "by_owner") throw new Error(`Unexpected index ${indexName}`);
+                  return {
+                    order: vi.fn(() => ({
+                      take: vi.fn().mockResolvedValue([
+                        makePackageDoc({
+                          _id: "packages:other-personal",
+                          name: "other-personal-plugin",
+                          ownerPublisherId: "publishers:other-personal",
+                        }),
+                        makePackageDoc({
+                          _id: "packages:org",
+                          name: "org-plugin",
+                          ownerPublisherId: "publishers:org",
+                        }),
+                        makePackageDoc({
+                          _id: "packages:legacy-direct",
+                          name: "legacy-direct-plugin",
+                          normalizedName: "legacy-direct-plugin",
+                          displayName: "Legacy Direct Plugin",
+                          ownerPublisherId: undefined,
+                          latestReleaseId: "packageReleases:legacy-1",
+                        }),
+                      ]),
+                    })),
+                  };
+                }),
+              };
+            }
+            throw new Error(`Unexpected table ${table}`);
+          }),
+        },
+      } as never,
+      { ownerUserId: "users:owner", limit: 20 },
+    );
+
+    expect(result.map((entry) => entry.name)).toEqual(["legacy-direct-plugin"]);
+  });
+
   it("returns no owner packages when the viewer lacks access", async () => {
     vi.mocked(getAuthUserId).mockResolvedValue("users:stranger" as never);
     const result = await listHandler(
       {
         db: {
           get: vi.fn(async (id: string) => {
+            if (id === "users:stranger") {
+              return { _id: "users:stranger", handle: "stranger", displayName: "Stranger" };
+            }
             if (id === "publishers:owner") {
               return {
                 _id: "publishers:owner",
@@ -5630,6 +6050,110 @@ describe("packages public queries", () => {
     );
 
     expect(result).toEqual([]);
+  });
+
+  it("ignores stale personal memberships for package dashboards", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:stranger" as never);
+    const result = await listHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === "publishers:owner") {
+              return {
+                _id: "publishers:owner",
+                kind: "user",
+                linkedUserId: "users:owner",
+              };
+            }
+            return null;
+          }),
+          query: vi.fn((table: string) => {
+            if (table === "packages") {
+              return {
+                withIndex: vi.fn(() => ({
+                  order: vi.fn(() => ({
+                    take: vi
+                      .fn()
+                      .mockResolvedValue([
+                        makePackageDoc({ ownerPublisherId: "publishers:owner" }),
+                      ]),
+                  })),
+                })),
+              };
+            }
+            if (table === "publisherMembers") {
+              return {
+                withIndex: vi.fn(() => ({
+                  unique: vi.fn().mockResolvedValue({
+                    _id: "publisherMembers:stale",
+                    publisherId: "publishers:owner",
+                    userId: "users:stranger",
+                    role: "owner",
+                  }),
+                })),
+              };
+            }
+            throw new Error(`Unexpected table ${table}`);
+          }),
+        },
+      } as never,
+      { ownerPublisherId: "publishers:owner", limit: 20 },
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it("keeps org memberships authorized for package dashboards", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:member" as never);
+    const result = await listHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === "users:member") {
+              return { _id: "users:member", handle: "member", displayName: "Member" };
+            }
+            if (id === "publishers:org") {
+              return {
+                _id: "publishers:org",
+                kind: "org",
+                handle: "team",
+                displayName: "Team",
+              };
+            }
+            return null;
+          }),
+          query: vi.fn((table: string) => {
+            if (table === "packages") {
+              return {
+                withIndex: vi.fn(() => ({
+                  order: vi.fn(() => ({
+                    take: vi
+                      .fn()
+                      .mockResolvedValue([makePackageDoc({ ownerPublisherId: "publishers:org" })]),
+                  })),
+                })),
+              };
+            }
+            if (table === "publisherMembers") {
+              return {
+                withIndex: vi.fn(() => ({
+                  unique: vi.fn().mockResolvedValue({
+                    _id: "publisherMembers:member",
+                    publisherId: "publishers:org",
+                    userId: "users:member",
+                    role: "publisher",
+                  }),
+                })),
+              };
+            }
+            throw new Error(`Unexpected table ${table}`);
+          }),
+        },
+      } as never,
+      { ownerPublisherId: "publishers:org", limit: 20 },
+    );
+
+    expect(result).toEqual([expect.objectContaining({ name: "demo-plugin" })]);
   });
 
   it("requires auth inside the public publish action", async () => {
@@ -6085,6 +6609,46 @@ describe("packages public queries", () => {
     });
   });
 
+  it("does not let stale personal ownerUserId read package moderation status", async () => {
+    await expect(
+      getPackageModerationStatusForUserInternalHandler(
+        {
+          db: {
+            get: vi.fn(async (id: string) => {
+              if (id === "users:viewer") return { _id: id, role: "user" };
+              return null;
+            }),
+            query: vi.fn((table: string) => {
+              if (table === "packages") {
+                return {
+                  withIndex: vi.fn(() => ({
+                    unique: vi.fn().mockResolvedValue(
+                      makePackageDoc({
+                        name: "@scope/demo",
+                        ownerKind: "user",
+                        ownerUserId: "users:viewer",
+                        ownerPublisherId: "publishers:other-personal",
+                      }),
+                    ),
+                  })),
+                };
+              }
+              if (table === "publisherMembers") {
+                return {
+                  withIndex: vi.fn(() => ({
+                    unique: vi.fn().mockResolvedValue(null),
+                  })),
+                };
+              }
+              throw new Error(`Unexpected table ${table}`);
+            }),
+          },
+        } as never,
+        { actorUserId: "users:viewer", name: "@scope/demo" },
+      ),
+    ).rejects.toThrow("Unauthorized");
+  });
+
   it("submits owner appeals for quarantined package releases", async () => {
     const insert = vi.fn(async (table: string) =>
       table === "packageAppeals" ? "packageAppeals:1" : "auditLogs:1",
@@ -6175,6 +6739,126 @@ describe("packages public queries", () => {
         targetType: "packageAppeal",
       }),
     );
+  });
+
+  it("does not let stale personal-publisher memberships submit package appeals", async () => {
+    const insert = vi.fn();
+
+    await expect(
+      submitPackageAppealForUserInternalHandler(
+        {
+          db: {
+            get: vi.fn(async (id: string) => {
+              if (id === "users:stale-member") return { _id: id, role: "user" };
+              if (id === "publishers:owner") {
+                return {
+                  _id: id,
+                  kind: "user",
+                  handle: "owner",
+                  linkedUserId: "users:owner",
+                };
+              }
+              return null;
+            }),
+            query: vi.fn((table: string) => {
+              if (table === "packages") {
+                return {
+                  withIndex: vi.fn(() => ({
+                    unique: vi.fn().mockResolvedValue(
+                      makePackageDoc({
+                        name: "@scope/demo",
+                        ownerUserId: "users:owner",
+                        ownerPublisherId: "publishers:owner",
+                      }),
+                    ),
+                  })),
+                };
+              }
+              if (table === "publisherMembers") {
+                return {
+                  withIndex: vi.fn(() => ({
+                    unique: vi.fn().mockResolvedValue({
+                      _id: "publisherMembers:stale",
+                      publisherId: "publishers:owner",
+                      userId: "users:stale-member",
+                      role: "admin",
+                    }),
+                  })),
+                };
+              }
+              throw new Error(`Unexpected table ${table}`);
+            }),
+            insert,
+            patch: vi.fn(),
+            replace: vi.fn(),
+            delete: vi.fn(),
+            normalizeId: vi.fn(),
+          },
+        } as never,
+        {
+          actorUserId: "users:stale-member",
+          name: "@scope/demo",
+          version: "1.2.3",
+          message: "please review",
+        },
+      ),
+    ).rejects.toThrow("Unauthorized");
+
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("does not let stale personal-publisher memberships read owner-only scan settings", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:stale-member" as never);
+
+    const result = await getClawScanNoteSettingsHandler(
+      {
+        db: {
+          get: vi.fn(async (id: string) => {
+            if (id === "users:stale-member") return { _id: id, role: "user" };
+            if (id === "publishers:owner") {
+              return {
+                _id: id,
+                kind: "user",
+                handle: "owner",
+                linkedUserId: "users:owner",
+              };
+            }
+            return null;
+          }),
+          query: vi.fn((table: string) => {
+            if (table === "packages") {
+              return {
+                withIndex: vi.fn(() => ({
+                  unique: vi.fn().mockResolvedValue(
+                    makePackageDoc({
+                      name: "@scope/demo",
+                      ownerUserId: "users:owner",
+                      ownerPublisherId: "publishers:owner",
+                    }),
+                  ),
+                })),
+              };
+            }
+            if (table === "publisherMembers") {
+              return {
+                withIndex: vi.fn(() => ({
+                  unique: vi.fn().mockResolvedValue({
+                    _id: "publisherMembers:stale",
+                    publisherId: "publishers:owner",
+                    userId: "users:stale-member",
+                    role: "admin",
+                  }),
+                })),
+              };
+            }
+            throw new Error(`Unexpected table ${table}`);
+          }),
+        },
+      } as never,
+      { name: "@scope/demo" },
+    );
+
+    expect(result).toBeNull();
   });
 
   it("lists package appeals for moderators", async () => {
