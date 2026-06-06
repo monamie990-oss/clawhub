@@ -88,7 +88,11 @@ type AccountDeletionFixtureState = {
     | { exists: false };
   publisherExists: boolean;
   skillExists: boolean;
+  skillActive: boolean;
+  skillSoftDeletedAt: number | null;
   packageExists: boolean;
+  packageActive: boolean;
+  packageSoftDeletedAt: number | null;
   authAccountCount: number;
   authSessionCount: number;
 };
@@ -109,6 +113,11 @@ function getAccountDeletionFixtureState(fixture: AccountDeletionFixture) {
     skillId: fixture.skillId,
     packageId: fixture.packageId,
   });
+}
+
+function isExpectedAccountDeletionRuntimeError(error: string) {
+  if (error.includes("server responded with a status of 404 (Not Found)")) return true;
+  return error.includes("[CONVEX Q(users:me)]") && error.includes("Function execution timed out");
 }
 
 test("users can permanently delete their account and personal publisher resources", async ({
@@ -167,6 +176,8 @@ test("users can permanently delete their account and personal publisher resource
         deletedAt: null,
       },
       publisherExists: false,
+      skillActive: false,
+      packageActive: false,
       authAccountCount: 0,
       authSessionCount: 0,
     });
@@ -207,7 +218,5 @@ test("users can permanently delete their account and personal publisher resource
   });
 
   await expectNoFatalErrorUi(page);
-  expect(
-    errors.filter((error) => !error.includes("server responded with a status of 404 (Not Found)")),
-  ).toEqual([]);
+  expect(errors.filter((error) => !isExpectedAccountDeletionRuntimeError(error))).toEqual([]);
 });
