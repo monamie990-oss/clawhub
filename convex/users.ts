@@ -432,7 +432,7 @@ export const upsertDevPersonaInternal = internalMutation({
     const patch = {
       handle: persona.handle,
       displayName: persona.displayName,
-      name: persona.displayName,
+      name: persona.handle,
       email: "email" in persona ? persona.email : undefined,
       role: persona.role,
       githubCreatedAt: DEV_PERSONA_GITHUB_CREATED_AT,

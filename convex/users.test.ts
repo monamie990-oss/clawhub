@@ -1082,6 +1082,37 @@ describe("users.upsertDevPersonaInternal", () => {
     expect(patches).toEqual([]);
   });
 
+  it("keeps the abuse persona auth name aligned with its stable handle", async () => {
+    process.env.DEV_AUTH_ENABLED = "1";
+    process.env.CONVEX_DEPLOYMENT = "local:dev";
+    process.env.CONVEX_SITE_URL = "http://localhost:3210";
+    const { ctx, inserts } = makeDevPersonaCtx();
+
+    await upsertDevPersonaInternalHandler(ctx, {
+      persona: "abusePublisher",
+    });
+
+    expect(inserts).toContainEqual(
+      expect.objectContaining({
+        table: "users",
+        value: expect.objectContaining({
+          handle: "local-abuse",
+          name: "local-abuse",
+          displayName: "Local Abuse Test Publisher",
+        }),
+      }),
+    );
+    expect(inserts).toContainEqual(
+      expect.objectContaining({
+        table: "publishers",
+        value: expect.objectContaining({
+          handle: "local-abuse",
+          displayName: "Local Abuse Test Publisher",
+        }),
+      }),
+    );
+  });
+
   it("seeds a non-platform-admin user who manages an official org", async () => {
     process.env.DEV_AUTH_ENABLED = "1";
     process.env.CONVEX_DEPLOYMENT = "local:dev";
